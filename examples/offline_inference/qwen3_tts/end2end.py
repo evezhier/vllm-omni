@@ -11,6 +11,7 @@ from typing import Any, NamedTuple
 
 import soundfile as sf
 import torch
+import time
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
@@ -66,7 +67,7 @@ def _estimate_prompt_len(
         return 2048
 
 
-def get_custom_voice_query(use_batch_sample: bool = False) -> QueryResult:
+def get_custom_voice_query(model_name: str = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice", use_batch_sample: bool = False) -> QueryResult:
     """Build CustomVoice sample inputs.
 
     Args:
@@ -76,7 +77,8 @@ def get_custom_voice_query(use_batch_sample: bool = False) -> QueryResult:
         QueryResult with Omni inputs and the CustomVoice model path.
     """
     task_type = "CustomVoice"
-    model_name = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+    model_name = model_name 
+    assert model_name.endswith(task_type)
     if use_batch_sample:
         texts = ["其实我真的有发现，我是一个特别善于观察别人情绪的人。", "She said she would be here by noon."]
         instructs = ["", "Very happy."]
@@ -121,7 +123,7 @@ def get_custom_voice_query(use_batch_sample: bool = False) -> QueryResult:
     )
 
 
-def get_voice_design_query(use_batch_sample: bool = False) -> QueryResult:
+def get_voice_design_query(model_name: str = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign", use_batch_sample: bool = False) -> QueryResult:
     """Build VoiceDesign sample inputs.
 
     Args:
@@ -131,7 +133,7 @@ def get_voice_design_query(use_batch_sample: bool = False) -> QueryResult:
         QueryResult with Omni inputs and the VoiceDesign model path.
     """
     task_type = "VoiceDesign"
-    model_name = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
+    model_name = model_name
     if use_batch_sample:
         texts = [
             "哥哥，你回来啦，人家等了你好久好久了，要抱抱！",
@@ -180,7 +182,7 @@ def get_voice_design_query(use_batch_sample: bool = False) -> QueryResult:
     )
 
 
-def get_base_query(use_batch_sample: bool = False, mode_tag: str = "icl") -> QueryResult:
+def get_base_query(model_name="Qwen/Qwen3-TTS-12Hz-1.7B-Base", use_batch_sample: bool = False, mode_tag: str = "icl") -> QueryResult:
     """Build Base (voice clone) sample inputs.
 
     Args:
@@ -191,7 +193,7 @@ def get_base_query(use_batch_sample: bool = False, mode_tag: str = "icl") -> Que
         QueryResult with Omni inputs and the Base model path.
     """
     task_type = "Base"
-    model_name = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+    model_name = model_name
     ref_audio_path_1 = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone_2.wav"
     ref_audio_single = ref_audio_path_1
     ref_text_single = (
@@ -261,9 +263,15 @@ def _build_inputs(args) -> tuple[str, list]:
 
     query_func = query_map[args.query_type]
     if args.query_type in {"CustomVoice", "VoiceDesign"}:
-        query_result = query_func(use_batch_sample=args.use_batch_sample)
+        query_result = query_func(
+            model_name=args.model_name,
+            use_batch_sample=args.use_batch_sample)
     elif args.query_type == "Base":
-        query_result = query_func(use_batch_sample=args.use_batch_sample, mode_tag=args.mode_tag)
+        query_result = query_func(
+            model_name=args.model_name,
+            use_batch_sample=args.use_batch_sample,
+            mode_tag=args.mode_tag,
+        )
     else:
         query_result = query_func()
 
@@ -276,13 +284,19 @@ def _build_inputs(args) -> tuple[str, list]:
             raise ValueError(f"No valid prompts found in {args.txt_prompts}")
         template = query_result.inputs if not isinstance(query_result.inputs, list) else query_result.inputs[0]
         template_info = template["additional_information"]
-        inputs = [
-            {
-                "prompt_token_ids": [0] * _estimate_prompt_len({**template_info, "text": [t]}, model_name),
-                "additional_information": {**template_info, "text": [t]},
-            }
-            for t in lines
-        ]
+        inputs = []
+        for i, text in enumerate(lines):
+            if i < args.num_prompts:
+                additional_information = {**template_info, "text": [text]}
+                inputs.append(
+                    {
+                        "prompt_token_ids": [0] * _estimate_prompt_len(additional_information, model_name),
+                        "additional_information": additional_information,
+                    }
+                )
+            else:
+                break
+            
     else:
         inputs = query_result.inputs if isinstance(query_result.inputs, list) else [query_result.inputs]
 
@@ -314,12 +328,30 @@ def main(args):
         stage_init_timeout=args.stage_init_timeout,
     )
 
+    total_requests = len(inputs)
+    processed_count = 0
+
+    profiler_enabled = bool(os.getenv("VLLM_TORCH_PROFILER_DIR"))
+    if profiler_enabled:
+        omni.start_profile(stages=[0, 1])
+
     batch_size = args.batch_size
     for batch_start in range(0, len(inputs), batch_size):
         batch = inputs[batch_start : batch_start + batch_size]
         for stage_outputs in omni.generate(batch):
             for output in stage_outputs.request_output:
                 _save_wav(output_dir, output.request_id, output.outputs[0].multimodal_output)
+                    processed_count += len(stage_outputs.request_output)
+                
+        if profiler_enabled and processed_count >= total_requests:
+            print(f"[Info] Processed {processed_count}/{total_requests}. Stopping profiler inside active loop...")
+            # Stop the profiler while workers are still alive
+            omni.stop_profile()
+
+            print("[Info] Waiting 30s for workers to write trace files to disk...")
+            time.sleep(30)
+            print("[Info] Trace export wait time finished.")
+    omni.close()
 
 
 async def main_streaming(args):
@@ -346,7 +378,6 @@ async def main_streaming(args):
             else:
                 _save_wav(output_dir, request_id, mm)
 
-
 def parse_args():
     parser = FlexibleArgumentParser(description="Demo on using vLLM for offline inference with audio language models")
     parser.add_argument(
@@ -356,6 +387,13 @@ def parse_args():
         default="CustomVoice",
         choices=query_map.keys(),
         help="Query type.",
+    )
+    parser.add_argument(
+        "--model-name",
+        "-m",
+        type=str,
+        default="Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+        help="Model name",
     )
     parser.add_argument(
         "--log-stats",
