@@ -21,6 +21,8 @@ from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
+from vllm.v1.utils import record_function_or_nullcontext
+
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
 else:
@@ -1052,31 +1054,33 @@ class OmniGPUModelRunner(GPUModelRunner):
         ec_connector_output = None
 
         if self.supports_mm_inputs and is_first_rank and not is_encoder_decoder:
-            # Run the multimodal encoder if any.
-            with self.maybe_get_ec_connector_output(
-                scheduler_output,
-                encoder_cache=self.encoder_cache,
-            ) as ec_connector_output:
-                self._execute_mm_encoder(scheduler_output)
-                mm_embeds, is_mm_embed = self._gather_mm_embeddings(scheduler_output)
+            with record_function_or_nullcontext("preprocessor: supports_mm_inputs embed_input_ids"):
 
-            # NOTE(woosuk): To unify token ids and soft tokens (vision
-            # embeddings), we always use embeddings (rather than token ids)
-            # as input to the multimodal model, even when the input is text.
-            inputs_embeds_scheduled = self.model.embed_input_ids(
-                self.input_ids.gpu[:num_scheduled_tokens],
-                multimodal_embeddings=mm_embeds,
-                is_multimodal=is_mm_embed,
-            )
+                # Run the multimodal encoder if any.
+                with self.maybe_get_ec_connector_output(
+                    scheduler_output,
+                    encoder_cache=self.encoder_cache,
+                ) as ec_connector_output:
+                    self._execute_mm_encoder(scheduler_output)
+                    mm_embeds, is_mm_embed = self._gather_mm_embeddings(scheduler_output)
 
-            # TODO(woosuk): Avoid the copy. Optimize.
-            self.inputs_embeds.gpu[:num_scheduled_tokens].copy_(inputs_embeds_scheduled)
+                # NOTE(woosuk): To unify token ids and soft tokens (vision
+                # embeddings), we always use embeddings (rather than token ids)
+                # as input to the multimodal model, even when the input is text.
+                inputs_embeds_scheduled = self.model.embed_input_ids(
+                    self.input_ids.gpu[:num_scheduled_tokens],
+                    multimodal_embeddings=mm_embeds,
+                    is_multimodal=is_mm_embed,
+                )
 
-            input_ids, inputs_embeds = self._prepare_mm_inputs(num_input_tokens)
-            model_kwargs = {
-                **self._init_model_kwargs(),
-                **self._extract_mm_kwargs(scheduler_output),
-            }
+                # TODO(woosuk): Avoid the copy. Optimize.
+                self.inputs_embeds.gpu[:num_scheduled_tokens].copy_(inputs_embeds_scheduled)
+
+                input_ids, inputs_embeds = self._prepare_mm_inputs(num_input_tokens)
+                model_kwargs = {
+                    **self._init_model_kwargs(),
+                    **self._extract_mm_kwargs(scheduler_output),
+                }
         elif self.enable_prompt_embeds and is_first_rank:
             # Get the input embeddings for the tokens that are not input embeds,
             # then put them into the appropriate positions.
@@ -1090,21 +1094,24 @@ class OmniGPUModelRunner(GPUModelRunner):
             # If a batch only has token ids, then including the embedding layer
             # in the CUDA graph will be more performant (like in the else case
             # below).
-            token_ids_idx = self.is_token_ids.gpu[:num_scheduled_tokens].nonzero(as_tuple=False).squeeze(1)
-            # Some tokens ids may need to become embeds
-            if token_ids_idx.numel() > 0:
-                token_ids = self.input_ids.gpu[token_ids_idx]
-                tokens_to_embeds = self.model.embed_input_ids(input_ids=token_ids)
-                self.inputs_embeds.gpu[token_ids_idx] = tokens_to_embeds
+            with record_function_or_nullcontext("preprocessor: enable_prompt_embeds embed_input_ids"):
+                token_ids_idx = self.is_token_ids.gpu[:num_scheduled_tokens].nonzero(as_tuple=False).squeeze(1)
+                # Some tokens ids may need to become embeds
+                if token_ids_idx.numel() > 0:
+                    token_ids = self.input_ids.gpu[token_ids_idx]
+                    tokens_to_embeds = self.model.embed_input_ids(input_ids=token_ids)
+                    self.inputs_embeds.gpu[token_ids_idx] = tokens_to_embeds
 
-            inputs_embeds = self.inputs_embeds.gpu[:num_input_tokens]
-            model_kwargs = self._init_model_kwargs()
-            input_ids = self.input_ids.gpu[:num_input_tokens]
+                inputs_embeds = self.inputs_embeds.gpu[:num_input_tokens]
+                model_kwargs = self._init_model_kwargs()
+                input_ids = self.input_ids.gpu[:num_input_tokens]
         elif getattr(self.model, "has_preprocess", False):
-            # Use pre-allocated buffer for CUDA graph compatibility.
-            input_ids = self.input_ids.gpu[:num_input_tokens]
-            inputs_embeds = self.inputs_embeds.gpu[:num_input_tokens]
-            model_kwargs = self._init_model_kwargs()
+            with record_function_or_nullcontext("has_preprocess is False: Use pre-allocated buffer"):
+
+                # Use pre-allocated buffer for CUDA graph compatibility.
+                input_ids = self.input_ids.gpu[:num_input_tokens]
+                inputs_embeds = self.inputs_embeds.gpu[:num_input_tokens]
+                model_kwargs = self._init_model_kwargs()
         else:
             # For text-only models, we use token ids as input.
             # While it is possible to use embeddings as input just like the
@@ -1150,58 +1157,62 @@ class OmniGPUModelRunner(GPUModelRunner):
         if inputs_embeds is not None:
             # Prefill: overlay prompt_embeds and collect additional_information
             self._collect_additional_information_for_prefill(num_scheduled_tokens_np)
+        
 
         if hasattr(self.model, "has_preprocess") and self.model.has_preprocess:
-            # Overlay custom prompt_embeds per request for the prompt portion;
-            # collect additional_information (tensor/list) for prefill portion only
-            decode_req_ids = []
-            if self.vllm_config.model_config.async_chunk:
-                self._update_additional_information(scheduler_output)
-            for req_index, req_id in enumerate(self.input_batch.req_ids):
-                req_state = self.requests.get(req_id)
-                req_infos = getattr(req_state, "additional_information_cpu", None) if req_state is not None else None
+            with record_function_or_nullcontext("preprocessor: model.preprocess"):
+                # Overlay custom prompt_embeds per request for the prompt portion;
+                # collect additional_information (tensor/list) for prefill portion only
+                decode_req_ids = []
+                if self.vllm_config.model_config.async_chunk:
+                    self._update_additional_information(scheduler_output)
+                for req_index, req_id in enumerate(self.input_batch.req_ids):
+                    req_state = self.requests.get(req_id)
+                    req_infos = getattr(req_state, "additional_information_cpu", None) if req_state is not None else None
 
-                # mimo-audio check
-                req_infos = self._maybe_attach_mimo_audio_req_infos(req_state, req_infos, req_id)
+                    # mimo-audio check
+                    req_infos = self._maybe_attach_mimo_audio_req_infos(req_state, req_infos, req_id)
 
-                start_offset = int(self.query_start_loc.cpu[req_index])
-                sched_tokens = int(num_scheduled_tokens_np[req_index])
-                s, e = start_offset, start_offset + sched_tokens
-                span_len = int(e) - int(s)
+                    start_offset = int(self.query_start_loc.cpu[req_index])
+                    sched_tokens = int(num_scheduled_tokens_np[req_index])
+                    s, e = start_offset, start_offset + sched_tokens
+                    span_len = int(e) - int(s)
 
-                # call the custom process function
-                embed_slice = inputs_embeds[s:e] if inputs_embeds is not None else None
-                req_input_ids, req_embeds, update_dict = self.model.preprocess(
-                    input_ids=input_ids[s:e], input_embeds=embed_slice, **req_infos
-                )
-                if inputs_embeds is None:
-                    inputs_embeds = torch.empty(
-                        (input_ids.shape[0], req_embeds.shape[-1]),
-                        device=req_embeds.device,
-                        dtype=req_embeds.dtype,
+
+                    # call the custom process function
+                    embed_slice = inputs_embeds[s:e] if inputs_embeds is not None else None
+                    req_input_ids, req_embeds, update_dict = self.model.preprocess(
+                        input_ids=input_ids[s:e], input_embeds=embed_slice, **req_infos
                     )
+                    if inputs_embeds is None:
+                        inputs_embeds = torch.empty(
+                            (input_ids.shape[0], req_embeds.shape[-1]),
+                            device=req_embeds.device,
+                            dtype=req_embeds.dtype,
+                        )
 
-                if hasattr(self.model, "talker_mtp") and span_len == 1:
-                    last_talker_hidden, text_step = update_dict.pop("mtp_inputs")
-                    decode_slice = slice(len(decode_req_ids), len(decode_req_ids) + 1)
-                    self.talker_mtp_input_ids.gpu[decode_slice].copy_(req_input_ids)
-                    self.talker_mtp_inputs_embeds.gpu[decode_slice].copy_(req_embeds)
-                    self.last_talker_hidden.gpu[decode_slice].copy_(last_talker_hidden)
-                    self.text_step.gpu[decode_slice].copy_(text_step)
-                    decode_req_ids.append(req_id)
+                    if hasattr(self.model, "talker_mtp") and span_len == 1:
+                        last_talker_hidden, text_step = update_dict.pop("mtp_inputs")
+                        decode_slice = slice(len(decode_req_ids), len(decode_req_ids) + 1)
+                        self.talker_mtp_input_ids.gpu[decode_slice].copy_(req_input_ids)
+                        self.talker_mtp_inputs_embeds.gpu[decode_slice].copy_(req_embeds)
+                        self.last_talker_hidden.gpu[decode_slice].copy_(last_talker_hidden)
+                        self.text_step.gpu[decode_slice].copy_(text_step)
+                        decode_req_ids.append(req_id)
 
-                # TODO(Peiqi): the merge stage could move out from the critical path
-                self._merge_additional_information_update(req_id, update_dict)
+                    # TODO(Peiqi): the merge stage could move out from the critical path
+                    self._merge_additional_information_update(req_id, update_dict)
 
-                # update the inputs_embeds and input_ids
-                seg_len = min(span_len, req_embeds.shape[0])
-                inputs_embeds[s : s + seg_len] = req_embeds[:seg_len]
-                if isinstance(req_input_ids, torch.Tensor) and req_input_ids.numel() == seg_len:
-                    input_ids[s : s + seg_len] = req_input_ids
+                    # update the inputs_embeds and input_ids
+                    seg_len = min(span_len, req_embeds.shape[0])
+                    inputs_embeds[s : s + seg_len] = req_embeds[:seg_len]
+                    if isinstance(req_input_ids, torch.Tensor) and req_input_ids.numel() == seg_len:
+                        input_ids[s : s + seg_len] = req_input_ids
 
-            # run talker mtp decode
-            if hasattr(self.model, "talker_mtp"):
-                self._talker_mtp_forward(decode_req_ids, inputs_embeds)
+            with record_function_or_nullcontext("talker_mtp: forward"):
+                # run talker mtp decode
+                if hasattr(self.model, "talker_mtp"):
+                    self._talker_mtp_forward(decode_req_ids, inputs_embeds)
 
         return (
             input_ids,
