@@ -341,16 +341,16 @@ def main(args):
         for stage_outputs in omni.generate(batch):
             for output in stage_outputs.request_output:
                 _save_wav(output_dir, output.request_id, output.outputs[0].multimodal_output)
-                    processed_count += len(stage_outputs.request_output)
-                
-        if profiler_enabled and processed_count >= total_requests:
-            print(f"[Info] Processed {processed_count}/{total_requests}. Stopping profiler inside active loop...")
-            # Stop the profiler while workers are still alive
-            omni.stop_profile()
+        
+            processed_count += len(stage_outputs.request_output)        
+            if profiler_enabled and processed_count >= total_requests:
+                print(f"[Info] Processed {processed_count}/{total_requests}. Stopping profiler inside active loop...")
+                # Stop the profiler while workers are still alive
+                omni.stop_profile()
 
-            print("[Info] Waiting 30s for workers to write trace files to disk...")
-            time.sleep(30)
-            print("[Info] Trace export wait time finished.")
+                print("[Info] Waiting 30s for workers to write trace files to disk...")
+                time.sleep(30)
+                print("[Info] Trace export wait time finished.")
     omni.close()
 
 
