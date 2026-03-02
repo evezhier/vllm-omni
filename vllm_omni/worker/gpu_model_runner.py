@@ -1054,33 +1054,31 @@ class OmniGPUModelRunner(GPUModelRunner):
         ec_connector_output = None
 
         if self.supports_mm_inputs and is_first_rank and not is_encoder_decoder:
-            with record_function_or_nullcontext("preprocessor: supports_mm_inputs embed_input_ids"):
+            # Run the multimodal encoder if any.
+            with self.maybe_get_ec_connector_output(
+                scheduler_output,
+                encoder_cache=self.encoder_cache,
+            ) as ec_connector_output:
+                self._execute_mm_encoder(scheduler_output)
+                mm_embeds, is_mm_embed = self._gather_mm_embeddings(scheduler_output)
 
-                # Run the multimodal encoder if any.
-                with self.maybe_get_ec_connector_output(
-                    scheduler_output,
-                    encoder_cache=self.encoder_cache,
-                ) as ec_connector_output:
-                    self._execute_mm_encoder(scheduler_output)
-                    mm_embeds, is_mm_embed = self._gather_mm_embeddings(scheduler_output)
+            # NOTE(woosuk): To unify token ids and soft tokens (vision
+            # embeddings), we always use embeddings (rather than token ids)
+            # as input to the multimodal model, even when the input is text.
+            inputs_embeds_scheduled = self.model.embed_input_ids(
+                self.input_ids.gpu[:num_scheduled_tokens],
+                multimodal_embeddings=mm_embeds,
+                is_multimodal=is_mm_embed,
+            )
 
-                # NOTE(woosuk): To unify token ids and soft tokens (vision
-                # embeddings), we always use embeddings (rather than token ids)
-                # as input to the multimodal model, even when the input is text.
-                inputs_embeds_scheduled = self.model.embed_input_ids(
-                    self.input_ids.gpu[:num_scheduled_tokens],
-                    multimodal_embeddings=mm_embeds,
-                    is_multimodal=is_mm_embed,
-                )
+            # TODO(woosuk): Avoid the copy. Optimize.
+            self.inputs_embeds.gpu[:num_scheduled_tokens].copy_(inputs_embeds_scheduled)
 
-                # TODO(woosuk): Avoid the copy. Optimize.
-                self.inputs_embeds.gpu[:num_scheduled_tokens].copy_(inputs_embeds_scheduled)
-
-                input_ids, inputs_embeds = self._prepare_mm_inputs(num_input_tokens)
-                model_kwargs = {
-                    **self._init_model_kwargs(),
-                    **self._extract_mm_kwargs(scheduler_output),
-                }
+            input_ids, inputs_embeds = self._prepare_mm_inputs(num_input_tokens)
+            model_kwargs = {
+                **self._init_model_kwargs(),
+                **self._extract_mm_kwargs(scheduler_output),
+            }
         elif self.enable_prompt_embeds and is_first_rank:
             # Get the input embeddings for the tokens that are not input embeds,
             # then put them into the appropriate positions.
@@ -1094,24 +1092,21 @@ class OmniGPUModelRunner(GPUModelRunner):
             # If a batch only has token ids, then including the embedding layer
             # in the CUDA graph will be more performant (like in the else case
             # below).
-            with record_function_or_nullcontext("preprocessor: enable_prompt_embeds embed_input_ids"):
-                token_ids_idx = self.is_token_ids.gpu[:num_scheduled_tokens].nonzero(as_tuple=False).squeeze(1)
-                # Some tokens ids may need to become embeds
-                if token_ids_idx.numel() > 0:
-                    token_ids = self.input_ids.gpu[token_ids_idx]
-                    tokens_to_embeds = self.model.embed_input_ids(input_ids=token_ids)
-                    self.inputs_embeds.gpu[token_ids_idx] = tokens_to_embeds
+            token_ids_idx = self.is_token_ids.gpu[:num_scheduled_tokens].nonzero(as_tuple=False).squeeze(1)
+            # Some tokens ids may need to become embeds
+            if token_ids_idx.numel() > 0:
+                token_ids = self.input_ids.gpu[token_ids_idx]
+                tokens_to_embeds = self.model.embed_input_ids(input_ids=token_ids)
+                self.inputs_embeds.gpu[token_ids_idx] = tokens_to_embeds
 
-                inputs_embeds = self.inputs_embeds.gpu[:num_input_tokens]
-                model_kwargs = self._init_model_kwargs()
-                input_ids = self.input_ids.gpu[:num_input_tokens]
+            inputs_embeds = self.inputs_embeds.gpu[:num_input_tokens]
+            model_kwargs = self._init_model_kwargs()
+            input_ids = self.input_ids.gpu[:num_input_tokens]
         elif getattr(self.model, "has_preprocess", False):
-            with record_function_or_nullcontext("has_preprocess is False: Use pre-allocated buffer"):
-
-                # Use pre-allocated buffer for CUDA graph compatibility.
-                input_ids = self.input_ids.gpu[:num_input_tokens]
-                inputs_embeds = self.inputs_embeds.gpu[:num_input_tokens]
-                model_kwargs = self._init_model_kwargs()
+            # Use pre-allocated buffer for CUDA graph compatibility.
+            input_ids = self.input_ids.gpu[:num_input_tokens]
+            inputs_embeds = self.inputs_embeds.gpu[:num_input_tokens]
+            model_kwargs = self._init_model_kwargs()
         else:
             # For text-only models, we use token ids as input.
             # While it is possible to use embeddings as input just like the

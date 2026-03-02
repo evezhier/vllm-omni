@@ -26,6 +26,8 @@ from vllm.model_executor.models.qwen3 import Qwen3Model
 from vllm.model_executor.models.utils import AutoWeightsLoader, PPMissingLayer, WeightsMapper, maybe_prefix
 from vllm.sequence import IntermediateTensors
 
+from vllm.v1.utils import record_function_or_nullcontext
+
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 from .configuration_qwen3_tts import Qwen3TTSConfig, Qwen3TTSSpeakerEncoderConfig, Qwen3TTSTalkerConfig
@@ -522,8 +524,9 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             codec_streaming = codec_streaming_raw
         else:
             codec_streaming = task_type == "Base"
-
+    
         if span_len > 1:
+
             # Prefill (prompt embeddings)
             prompt_embeds_cpu = info_dict.get("talker_prompt_embeds")
             tts_pad_embed_cpu = info_dict.get("tts_pad_embed")
@@ -535,49 +538,53 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             # Subsequent prefill rounds (multi-chunk): prompt_embeds_cpu is a Tensor stored by the first round.
             is_first_prefill = not isinstance(prompt_embeds_cpu, torch.Tensor) or prompt_embeds_cpu.ndim != 2
             if is_first_prefill:
-                full_prompt_embeds, tailing_text_hidden, tts_pad_embed, ref_code_len = self._build_prompt_embeds(
-                    task_type=task_type, info_dict=info_dict
-                )
-                # Store full prompt embeddings + trailing queue on CPU for later chunks/steps.
-                prompt_embeds_cpu = full_prompt_embeds.detach().to("cpu").contiguous()
-                info_update: dict[str, Any] = {
-                    "talker_prompt_embeds": prompt_embeds_cpu,
-                    "tailing_text_hidden": tailing_text_hidden.detach().to("cpu").contiguous(),
-                    "tts_pad_embed": tts_pad_embed.detach().to("cpu").contiguous(),
-                    "talker_prefill_offset": 0,
-                    "codec_streaming": codec_streaming,
-                }
-                if ref_code_len is not None:
-                    info_update["ref_code_len"] = int(ref_code_len)
-                # Always return a span_len slice; if the scheduled placeholder is longer, pad with tts_pad_embed.
-                # This preserves placeholder/embedding alignment.
-                offset = 0
-                s = 0
-                e = span_len
-                take = prompt_embeds_cpu[s:e]
-                if int(take.shape[0]) < span_len:
-                    pad_n = int(span_len - int(take.shape[0]))
-                    pad_rows = tts_pad_embed.detach().to("cpu").contiguous().reshape(1, -1).expand(pad_n, -1)
-                    take = torch.cat([take, pad_rows], dim=0)
-                prompt_embeds = take.to(device=input_ids.device, dtype=torch.bfloat16)
-                info_update["talker_prefill_offset"] = int(offset + span_len)
-            else:
-                # Subsequent prefill chunk: slice from stored embeddings at running offset.
-                if tts_pad_embed is None:
-                    raise RuntimeError("Missing `tts_pad_embed` in additional_information; prefill must initialize it.")
-                offset = int(info_dict.get("talker_prefill_offset", 0) or 0)
-                if offset < 0:
+                with record_function_or_nullcontext("model.preprocess: first prefill: _build_prompt_embeds"):
+                    full_prompt_embeds, tailing_text_hidden, tts_pad_embed, ref_code_len = self._build_prompt_embeds(
+                        task_type=task_type, info_dict=info_dict
+                    )
+                with record_function_or_nullcontext("model.preprocess: first prefill: Store full prompt embeddings"):
+                    # Store full prompt embeddings + trailing queue on CPU for later chunks/steps.
+                    prompt_embeds_cpu = full_prompt_embeds.detach().to("cpu").contiguous()
+                    info_update: dict[str, Any] = {
+                        "talker_prompt_embeds": prompt_embeds_cpu,
+                        "tailing_text_hidden": tailing_text_hidden.detach().to("cpu").contiguous(),
+                        "tts_pad_embed": tts_pad_embed.detach().to("cpu").contiguous(),
+                        "talker_prefill_offset": 0,
+                        "codec_streaming": codec_streaming,
+                    }
+                    if ref_code_len is not None:
+                        info_update["ref_code_len"] = int(ref_code_len)
+                    # Always return a span_len slice; if the scheduled placeholder is longer, pad with tts_pad_embed.
+                    # This preserves placeholder/embedding alignment.
                     offset = 0
-                s = max(0, min(offset, int(prompt_embeds_cpu.shape[0])))
-                e = max(0, min(offset + span_len, int(prompt_embeds_cpu.shape[0])))
-                take = prompt_embeds_cpu[s:e]
-                if int(take.shape[0]) < span_len:
-                    pad_n = int(span_len - int(take.shape[0]))
-                    pad_rows = tts_pad_embed.detach().to("cpu").contiguous().reshape(1, -1).expand(pad_n, -1)
-                    take = torch.cat([take, pad_rows], dim=0)
-                prompt_embeds = take.to(device=input_ids.device, dtype=torch.bfloat16)
-                info_update = {"talker_prefill_offset": int(offset + span_len)}
-                info_update["codec_streaming"] = codec_streaming
+                    s = 0
+                    e = span_len
+                    take = prompt_embeds_cpu[s:e]
+                    if int(take.shape[0]) < span_len:
+                        pad_n = int(span_len - int(take.shape[0]))
+                        pad_rows = tts_pad_embed.detach().to("cpu").contiguous().reshape(1, -1).expand(pad_n, -1)
+                        take = torch.cat([take, pad_rows], dim=0)
+                    prompt_embeds = take.to(device=input_ids.device, dtype=torch.bfloat16)
+                    info_update["talker_prefill_offset"] = int(offset + span_len)
+            else:
+            # Subsequent prefill chunk: slice from stored embeddings at running offset.
+
+                with record_function_or_nullcontext("model.preprocess: Subsequent prefill"):
+                    if tts_pad_embed is None:
+                        raise RuntimeError("Missing `tts_pad_embed` in additional_information; prefill must initialize it.")
+                    offset = int(info_dict.get("talker_prefill_offset", 0) or 0)
+                    if offset < 0:
+                        offset = 0
+                    s = max(0, min(offset, int(prompt_embeds_cpu.shape[0])))
+                    e = max(0, min(offset + span_len, int(prompt_embeds_cpu.shape[0])))
+                    take = prompt_embeds_cpu[s:e]
+                    if int(take.shape[0]) < span_len:
+                        pad_n = int(span_len - int(take.shape[0]))
+                        pad_rows = tts_pad_embed.detach().to("cpu").contiguous().reshape(1, -1).expand(pad_n, -1)
+                        take = torch.cat([take, pad_rows], dim=0)
+                    prompt_embeds = take.to(device=input_ids.device, dtype=torch.bfloat16)
+                    info_update = {"talker_prefill_offset": int(offset + span_len)}
+                    info_update["codec_streaming"] = codec_streaming
 
             # When inputs_embeds is set, token ids are ignored by the model but must stay in-vocab for vLLM bookkeeping.
             input_ids_out = input_ids.clone()
@@ -593,29 +600,30 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
 
         # Decode: span_len == 1
         # Pop one text-step vector from tailing_text_hidden queue.
-        tts_pad_embed_cpu = info_dict.get("tts_pad_embed")
-        if not isinstance(tts_pad_embed_cpu, torch.Tensor):
-            raise RuntimeError("Missing `tts_pad_embed` in additional_information; prefill must run first.")
-        tts_pad_embed = tts_pad_embed_cpu.to(device=input_ids.device, dtype=torch.bfloat16).reshape(1, -1)
+        with record_function_or_nullcontext("model.preprocess: prefill"):
+            tts_pad_embed_cpu = info_dict.get("tts_pad_embed")
+            if not isinstance(tts_pad_embed_cpu, torch.Tensor):
+                raise RuntimeError("Missing `tts_pad_embed` in additional_information; prefill must run first.")
+            tts_pad_embed = tts_pad_embed_cpu.to(device=input_ids.device, dtype=torch.bfloat16).reshape(1, -1)
 
-        tail_cpu = info_dict.get("tailing_text_hidden")
-        if isinstance(tail_cpu, torch.Tensor) and tail_cpu.ndim == 2 and tail_cpu.shape[0] > 0:
-            text_step = tail_cpu[:1].to(device=input_ids.device, dtype=torch.bfloat16).reshape(1, -1)
-            new_tail = tail_cpu[1:].detach().to("cpu").contiguous() if tail_cpu.shape[0] > 1 else tail_cpu[:0]
-        else:
-            text_step = tts_pad_embed
-            new_tail = tail_cpu if isinstance(tail_cpu, torch.Tensor) else torch.empty((0, tts_pad_embed.shape[-1]))
+            tail_cpu = info_dict.get("tailing_text_hidden")
+            if isinstance(tail_cpu, torch.Tensor) and tail_cpu.ndim == 2 and tail_cpu.shape[0] > 0:
+                text_step = tail_cpu[:1].to(device=input_ids.device, dtype=torch.bfloat16).reshape(1, -1)
+                new_tail = tail_cpu[1:].detach().to("cpu").contiguous() if tail_cpu.shape[0] > 1 else tail_cpu[:0]
+            else:
+                text_step = tts_pad_embed
+                new_tail = tail_cpu if isinstance(tail_cpu, torch.Tensor) else torch.empty((0, tts_pad_embed.shape[-1]))
 
-        last_hidden_cpu = info_dict.get("last_talker_hidden")
-        if not isinstance(last_hidden_cpu, torch.Tensor):
-            raise RuntimeError("Missing `last_talker_hidden` in additional_information; postprocess must run.")
-        past_hidden = last_hidden_cpu.to(device=input_ids.device, dtype=torch.bfloat16).reshape(1, -1)
+            last_hidden_cpu = info_dict.get("last_talker_hidden")
+            if not isinstance(last_hidden_cpu, torch.Tensor):
+                raise RuntimeError("Missing `last_talker_hidden` in additional_information; postprocess must run.")
+            past_hidden = last_hidden_cpu.to(device=input_ids.device, dtype=torch.bfloat16).reshape(1, -1)
 
-        # Use OmniGPUModelRunner talker_mtp fast-path for residual codebooks and per-step inputs_embeds update.
-        last_id_hidden = self.embed_input_ids(input_ids.reshape(1, 1).to(torch.long)).to(
-            device=input_ids.device, dtype=torch.bfloat16
-        )
-        inputs_embeds_out = last_id_hidden.reshape(1, -1)
+            # Use OmniGPUModelRunner talker_mtp fast-path for residual codebooks and per-step inputs_embeds update.
+            last_id_hidden = self.embed_input_ids(input_ids.reshape(1, 1).to(torch.long)).to(
+                device=input_ids.device, dtype=torch.bfloat16
+            )
+            inputs_embeds_out = last_id_hidden.reshape(1, -1)
 
         info_update = {
             "tailing_text_hidden": new_tail,
@@ -1560,17 +1568,18 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         if max_steps <= 0:
             audio_codes = input_ids.reshape(bsz, 1)
             return (last_id_hidden + text_step).reshape(bsz, -1), audio_codes
+        with record_function_or_nullcontext("talker_mtp: code_predictor"):
 
-        # Predict residual codes (1..Q-1) with HF reference sampling params.
-        audio_codes = self.code_predictor(
-            layer0_code=input_ids.reshape(bsz, 1),
-            layer0_embed=last_id_hidden,
-            last_talker_hidden=past_hidden,
-            do_sample=True,
-            temperature=0.9,
-            top_k=50,
-            top_p=1.0,
-        )  # [B, Q]
+            # Predict residual codes (1..Q-1) with HF reference sampling params.
+            audio_codes = self.code_predictor(
+                layer0_code=input_ids.reshape(bsz, 1),
+                layer0_embed=last_id_hidden,
+                last_talker_hidden=past_hidden,
+                do_sample=True,
+                temperature=0.9,
+                top_k=50,
+                top_p=1.0,
+            )  # [B, Q]
 
         # Map invalid layer-0 ids (e.g. EOS) to PAD=0 so SpeechTokenizer sees only real codes.
         layer0 = audio_codes[:, :1]

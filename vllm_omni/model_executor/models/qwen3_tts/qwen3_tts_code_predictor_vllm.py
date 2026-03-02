@@ -18,6 +18,8 @@ from vllm.model_executor.models.utils import is_pp_missing_parameter
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, KVCacheSpec, KVCacheTensor
 from vllm.v1.worker.gpu import attn_utils
 
+from vllm.v1.utils import record_function_or_nullcontext
+
 from .configuration_qwen3_tts import Qwen3TTSTalkerCodePredictorConfig, Qwen3TTSTalkerConfig
 
 
@@ -465,31 +467,33 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
 
         # Prefill: feed [last_talker_hidden, layer0_embed] → logits for group 1.
         prefill_input = torch.cat([last_talker_hidden, layer0_embed], dim=1)  # [B, 2, H]
-        logits = self.prefill_logits(prefill_input)  # [B, vocab]
+        with record_function_or_nullcontext("talker_mtp: code_predictor: prefill_logits"):
+            logits = self.prefill_logits(prefill_input)  # [B, vocab]
 
         all_codes = [layer0_code.reshape(bsz, 1)]
         past_seq_len = 2
 
-        for step in range(1, num_groups):
-            # Sample or argmax from logits.
-            if do_sample and temperature > 0:
-                scaled = logits / temperature
-                if top_k > 0:
-                    topk_vals, _ = scaled.topk(top_k, dim=-1)
-                    scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
-                probs = torch.softmax(scaled, dim=-1)
-                next_ids = torch.multinomial(probs, num_samples=1)  # [B, 1]
-            else:
-                next_ids = logits.argmax(dim=-1, keepdim=True)  # [B, 1]
-            all_codes.append(next_ids)
+        with record_function_or_nullcontext("talker_mtp: code_predictor: decode_logits"):
+            for step in range(1, num_groups):
+                # Sample or argmax from logits.
+                if do_sample and temperature > 0:
+                    scaled = logits / temperature
+                    if top_k > 0:
+                        topk_vals, _ = scaled.topk(top_k, dim=-1)
+                        scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
+                    probs = torch.softmax(scaled, dim=-1)
+                    next_ids = torch.multinomial(probs, num_samples=1)  # [B, 1]
+                else:
+                    next_ids = logits.argmax(dim=-1, keepdim=True)  # [B, 1]
+                all_codes.append(next_ids)
 
-            # If not the last step, decode one more token.
-            if step < max_steps:
-                logits = self.decode_logits(
-                    next_ids.reshape(bsz),
-                    generation_step=step,
-                    past_seq_len=past_seq_len,
-                )
-                past_seq_len += 1
+                # If not the last step, decode one more token.
+                if step < max_steps:
+                    logits = self.decode_logits(
+                        next_ids.reshape(bsz),
+                        generation_step=step,
+                        past_seq_len=past_seq_len,
+                    )
+                    past_seq_len += 1
 
         return torch.cat(all_codes, dim=1)  # [B, Q]
