@@ -423,6 +423,7 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         )
         logger.info("code_predictor: torch.compile enabled (mode=default)")
 
+    
     # ------------------------------------------------------------------
     #  Optimized forward: re-prefill + torch.compile + projection cache
     # ------------------------------------------------------------------

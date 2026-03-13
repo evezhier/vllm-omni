@@ -406,6 +406,10 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         self._tokenizer = None
         self._speech_tokenizer: Qwen3TTSTokenizer | None = None
 
+        # CUDA Graph support
+        self._cudagraph_enabled = False
+        self._cudagraph_wrapper = None
+
     # -------------------- vLLM required hooks --------------------
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
@@ -1569,10 +1573,48 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         logger.info("Loaded %d weights for Qwen3TTSTalkerForConditionalGeneration", len(loaded))
         return loaded
 
+    def enable_cudagraph(self,
+        capture_sizes: list[int] | None = None,
+        device: torch.device | None = None,
+        ):
+        from ..cuda_graph_decoder_wrapper import TalkerMTPCudaGraphWrapper
+
+        if self.device is None:
+            device = next(self.model.parameters()).device
+        if self.device.type != "cuda":
+            logger.warning("Cannot enable CUDA Graph: talker is not on a CUDA device (got %s)", device)
+            return
+
+        # CUDA graph for transformer and code predictor
+        self._cudagraph_wrapper = TalkerMTPCudaGraphWrapper(
+            talker_model=self,
+            talker_config=self.talker_config,
+            capture_sizes=capture_sizes,
+            # num_quantizers=self.config.num_quantizers,
+            enabled=True,
+        )
+        self._cudagraph_wrapper.warmup(device, dtype=torch.long)
+        self._cudagraph_enabled = True
+        sizes = self._cudagraph_wrapper.capture_sizes
+        logger.info("CUDA Graph enabled for talker with sizes: %s", sizes)
+
     # -------------------- GPU-side MTP fast-path --------------------
 
-    @torch.inference_mode()
     def talker_mtp(
+        self,
+        input_ids: torch.Tensor,
+        input_embeds: torch.Tensor,
+        last_talker_hidden: torch.Tensor,
+        text_step: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._cudagraph_enabled:
+            return self._cudagraph_wrapper._talker_mtp(
+                input_ids, input_embeds, last_talker_hidden, text_step)
+        return self._talker_mtp(
+            input_ids, input_embeds, last_talker_hidden, text_step)
+    
+    @torch.inference_mode()
+    def _talker_mtp(
         self,
         input_ids: torch.Tensor,
         input_embeds: torch.Tensor,
