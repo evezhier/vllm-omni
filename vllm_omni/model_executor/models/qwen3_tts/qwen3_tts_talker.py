@@ -621,10 +621,13 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             text_step = tts_pad_embed
             new_tail = tail_cpu if isinstance(tail_cpu, torch.Tensor) else torch.empty((0, tts_pad_embed.shape[-1]))
 
-        last_hidden_cpu = info_dict.get("last_talker_hidden")
-        if not isinstance(last_hidden_cpu, torch.Tensor):
+        # last_hidden_cpu = info_dict.get("last_talker_hidden")
+        last_hidden_gpu = info_dict.get("last_talker_hidden")
+        if not isinstance(last_hidden_gpu, torch.Tensor):
             raise RuntimeError("Missing `last_talker_hidden` in additional_information; postprocess must run.")
-        past_hidden = last_hidden_cpu.to(device=input_ids.device, dtype=torch.bfloat16).reshape(1, -1)
+        assert last_hidden_gpu.device == input_ids.device
+        past_hidden = last_hidden_gpu
+        # past_hidden = last_hidden_cpu.to(device=input_ids.device, dtype=torch.bfloat16).reshape(1, -1)
 
         # Use OmniGPUModelRunner talker_mtp fast-path for residual codebooks and per-step inputs_embeds update.
         last_id_hidden = self.embed_input_ids(input_ids.reshape(1, 1).to(torch.long)).to(
@@ -643,7 +646,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # Keep the last token hidden for the next decode step's code predictor.
         if hidden_states.numel() == 0:
             return {}
-        last = hidden_states[-1, :].detach().to("cpu").contiguous()
+        last = hidden_states[-1, :]#.detach().to("cpu").contiguous()
         return {"last_talker_hidden": last}
 
     # -------------------- prompt construction helpers --------------------
