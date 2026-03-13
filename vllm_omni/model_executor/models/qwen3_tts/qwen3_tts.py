@@ -113,12 +113,6 @@ class Qwen3TTSModelForGeneration(nn.Module):
                 logger.info("CUDA Graph enabled for speech tokenizer decoder")
         except Exception:
                 logger.warning("Failed to enable CUDA Graph for decoder", exc_info=True)
-        try:
-            # Talker graph
-            if hasattr(self.model.model, "enable_cudagraph"):
-                self.model.model.enable_cudagraph()
-        except Exception:
-            logger.warning("Failed to enable CUDA Graph for talker mtp", exc_info=True)
 
 
     @staticmethod

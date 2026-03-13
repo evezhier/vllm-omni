@@ -28,13 +28,11 @@ class TalkerMTPCudaGraphWrapper:
         self,
         talker_model,
         talker_config,
-        capture_sizes,
         device='cuda',
         enabled=True,
     ):
         self.device = device
         self.device_index = torch.device(device).index or 0
-        self.capture_sizes = capture_sizes
         self.enabled = enabled
 
         self.talker = talker_model
@@ -55,13 +53,16 @@ class TalkerMTPCudaGraphWrapper:
         self.graph = None
         self.captured = False
 
+
+    @torch.inference_mode
     def _mtp_forward(self):
         """The actual MTP computation to be captured."""
         # Code predictor forward — deterministic argmax, required for CUDA graph.
-        audio_codes = self.code_predictor.forward_deterministic(
+        audio_codes = self.code_predictor.forward(
             layer0_code=self.input_ids_buf,
             layer0_embed=self.last_id_hidden_buf,
             last_talker_hidden=self.past_hidden_buf,
+            do_sample=False,
         )
         self.audio_codes_buf.copy_(audio_codes)
 
@@ -101,7 +102,7 @@ class TalkerMTPCudaGraphWrapper:
         torch.cuda.synchronize()
         self.captured = True
 
-    def warmup(self, device: torch.device, dtype: torch.dtype = torch.long):
+    def warmup(self, device: torch.device):
         """Warm up and capture the CUDA graph."""
         if not self.enabled:
             logger.info("TalkerMTPCudaGraphWrapper: disabled, skipping capture")
