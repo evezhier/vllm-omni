@@ -1582,9 +1582,9 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         ):
         from ..cuda_graph_decoder_wrapper import TalkerMTPCudaGraphWrapper
 
-        if self.device is None:
+        if device is None:
             device = next(self.model.parameters()).device
-        if self.device.type != "cuda":
+        if device.type != "cuda":
             logger.warning("Cannot enable CUDA Graph: talker is not on a CUDA device (got %s)", device)
             return
 
