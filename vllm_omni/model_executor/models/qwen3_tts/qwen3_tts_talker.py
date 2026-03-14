@@ -403,6 +403,9 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         self._cudagraph_enabled = False
         self._cudagraph_wrapper = None
 
+        # Keys that should stay on GPU in model_intermediate_buffer to avoid CPU↔GPU round-trips
+        self.gpu_resident_buffer_keys: set[str] = {"last_talker_hidden"}
+
     # -------------------- vLLM required hooks --------------------
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
@@ -623,13 +626,11 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             text_step = tts_pad_embed
             new_tail = tail_cpu if isinstance(tail_cpu, torch.Tensor) else torch.empty((0, tts_pad_embed.shape[-1]))
 
-        # last_hidden_cpu = info_dict.get("last_talker_hidden")
         last_hidden_gpu = info_dict.get("last_talker_hidden")
         if not isinstance(last_hidden_gpu, torch.Tensor):
             raise RuntimeError("Missing `last_talker_hidden` in additional_information; postprocess must run.")
         assert last_hidden_gpu.device == input_ids.device
         past_hidden = last_hidden_gpu
-        # past_hidden = last_hidden_cpu.to(device=input_ids.device, dtype=torch.bfloat16).reshape(1, -1)
 
         # Use OmniGPUModelRunner talker_mtp fast-path for residual codebooks and per-step inputs_embeds update.
         last_id_hidden = self.embed_input_ids(input_ids.reshape(1, 1).to(torch.long)).to(
