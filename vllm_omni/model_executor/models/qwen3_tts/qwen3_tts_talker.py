@@ -26,6 +26,8 @@ from vllm.model_executor.models.qwen3 import Qwen3Model
 from vllm.model_executor.models.utils import AutoWeightsLoader, PPMissingLayer, WeightsMapper, maybe_prefix
 from vllm.sequence import IntermediateTensors
 
+from vllm.v1.utils import record_function_or_nullcontext
+
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 from .configuration_qwen3_tts import Qwen3TTSConfig, Qwen3TTSSpeakerEncoderConfig, Qwen3TTSTalkerConfig
@@ -1591,11 +1593,13 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         last_talker_hidden: torch.Tensor,
         text_step: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self._cudagraph_enabled:
-            return self._cudagraph_wrapper._talker_mtp(
+        with record_function_or_nullcontext("talker_mtp"):
+
+            if self._cudagraph_enabled:
+                return self._cudagraph_wrapper._talker_mtp(
+                    input_ids, input_embeds, last_talker_hidden, text_step)
+            return self._talker_mtp(
                 input_ids, input_embeds, last_talker_hidden, text_step)
-        return self._talker_mtp(
-            input_ids, input_embeds, last_talker_hidden, text_step)
     
     @torch.inference_mode()
     def _talker_mtp(
