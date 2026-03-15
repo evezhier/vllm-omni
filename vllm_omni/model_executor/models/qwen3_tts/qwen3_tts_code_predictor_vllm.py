@@ -438,6 +438,7 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         temperature: float = 0.9,
         top_k: int = 50,
         top_p: float = 1.0,
+        gumbel_noise: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Predict residual codebooks 1..Q-1 autoregressively via re-prefill.
 
@@ -470,7 +471,8 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
         proj_buf[:bsz, 1, :] = projection(layer0_embed.reshape(bsz, 1, -1)).reshape(bsz, -1)
 
         use_sampling = do_sample and temperature > 0
-        inv_temperature = 1.0 / max(temperature, 1e-6) if use_sampling else 0.0
+        use_gumbel = gumbel_noise is not None
+        inv_temperature = 1.0 / max(temperature, 1e-6) if (use_sampling or use_gumbel) else 0.0
         if use_sampling and top_p != 1.0:
             raise NotImplementedError(
                 "top_p sampling is not implemented for the vLLM-native code predictor; please set top_p=1.0."
@@ -486,7 +488,16 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(nn.Module):
 
             logits = lm_heads[step - 1](hidden_out[:, -1, :])
 
-            if use_sampling:
+            if use_gumbel:
+                # Mathematically equivalent to multinomial sampling but uses only argmax,
+                # making it CUDA-graph-compatible. Noise is pre-sampled outside the graph
+                # and injected via static buffers.
+                scaled = logits * inv_temperature
+                if top_k > 0:
+                    topk_vals, _ = scaled.topk(top_k, dim=-1)
+                    scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
+                next_ids = (scaled + gumbel_noise[step - 1]).argmax(dim=-1, keepdim=True)
+            elif use_sampling:
                 scaled = logits * inv_temperature
                 if top_k > 0:
                     topk_vals, _ = scaled.topk(top_k, dim=-1)

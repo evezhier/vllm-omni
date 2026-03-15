@@ -19,7 +19,7 @@ class TalkerMTPCudaGraphWrapper:
     CUDA Graph wrapper for talker_mtp (multi-token prediction).
 
     Captures the entire MTP pipeline:
-    - Code predictor forward (residual codebooks, argmax/deterministic)
+    - Code predictor forward (residual codebooks, Gumbel-max sampling)
     - Embedding summation
     - Text step addition
     """
@@ -30,6 +30,8 @@ class TalkerMTPCudaGraphWrapper:
         talker_config,
         device='cuda',
         enabled=True,
+        temperature=0.9,
+        top_k=50,
     ):
         self.device = device
         self.device_index = torch.device(device).index or 0
@@ -39,6 +41,9 @@ class TalkerMTPCudaGraphWrapper:
         self.code_predictor = talker_model.code_predictor
         self.num_code_groups = talker_config.num_code_groups
         self.hidden_size = talker_config.hidden_size
+        self.vocab_size = talker_model.code_predictor.config.vocab_size
+        self.temperature = temperature
+        self.top_k = top_k
 
         # Static input buffers (fixed on GPU)
         self.input_ids_buf = torch.zeros(1, 1, dtype=torch.long, device=device)
@@ -50,19 +55,34 @@ class TalkerMTPCudaGraphWrapper:
         self.audio_codes_buf = torch.zeros(1, self.num_code_groups, dtype=torch.long, device=device)
         self.inputs_embeds_out_buf = torch.zeros(1, self.hidden_size, dtype=torch.bfloat16, device=device)
 
+        # Gumbel noise requred to enable stochastic sampling
+        self.gumbel_noise_bufs = [
+            torch.zeros(1, self.vocab_size, dtype=torch.bfloat16, device=device)
+            for _ in range(self.num_code_groups - 1)
+        ]
+
         self.graph = None
         self.captured = False
 
 
+    def _refresh_gumbel_noise(self) -> None:
+        """Regenerate Gumbel(0,1) noise in-place for each residual codebook step."""
+        for buf in self.gumbel_noise_bufs:
+            u = torch.rand(buf.shape, device=buf.device, dtype=torch.float32)
+            u.clamp_(1e-10, 1.0 - 1e-10)
+            buf.copy_(-torch.log(-torch.log(u)))
+
     @torch.inference_mode
     def _mtp_forward(self):
         """The actual MTP computation to be captured."""
-        # Code predictor forward — deterministic argmax, required for CUDA graph.
         audio_codes = self.code_predictor.forward(
             layer0_code=self.input_ids_buf,
             layer0_embed=self.last_id_hidden_buf,
             last_talker_hidden=self.past_hidden_buf,
-            do_sample=False,
+            do_sample=True,
+            temperature=self.temperature,
+            top_k=self.top_k,
+            gumbel_noise=self.gumbel_noise_bufs,
         )
         self.audio_codes_buf.copy_(audio_codes)
 
@@ -82,6 +102,7 @@ class TalkerMTPCudaGraphWrapper:
         # Warmup runs on the default stream to trigger torch.compile JIT and
         # pre-allocate all buffers before graph capture.
         for _ in range(3):
+            self._refresh_gumbel_noise()
             self._mtp_forward()
         torch.cuda.synchronize(self.device)
 
@@ -131,6 +152,7 @@ class TalkerMTPCudaGraphWrapper:
         self.last_id_hidden_buf.copy_(last_id_hidden.reshape(1, 1, -1))
         self.past_hidden_buf.copy_(past_hidden.reshape(1, 1, -1))
         self.text_step_buf.copy_(text_step.reshape(1, 1, -1))
+        self._refresh_gumbel_noise()
 
         # Replay graph
         self.graph.replay()
