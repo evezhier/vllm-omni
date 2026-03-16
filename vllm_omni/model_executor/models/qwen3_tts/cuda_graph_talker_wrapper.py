@@ -23,6 +23,7 @@ class TalkerMTPCudaGraphWrapper:
         enabled=True,
         temperature=0.9,
         top_k=50,
+        num_warmup_steps=3,
     ):
         self.device = device
         self.device_index = torch.device(device).index or 0
@@ -46,12 +47,20 @@ class TalkerMTPCudaGraphWrapper:
         self.audio_codes_buf = torch.zeros(1, self.num_code_groups, dtype=torch.long, device=device)
         self.inputs_embeds_out_buf = torch.zeros(1, self.hidden_size, dtype=torch.bfloat16, device=device)
 
+        self.num_warmup_steps = num_warmup_steps
         self.warmed_up = False
         self.graph = None
         self.captured = False
 
     @torch.inference_mode
     def _mtp_forward(self):
+        """Run the full MTP pipeline once; this is the function captured by the graph.
+
+        Calls the code predictor to generate residual codebook tokens, then
+        accumulates their embeddings together with the layer-0 hidden state and
+        the text step to produce the next-step input embedding.
+        Results are written into the static output buffers.
+        """
         audio_codes = self.code_predictor.forward(
             layer0_code=self.input_ids_buf,
             layer0_embed=self.last_id_hidden_buf,
@@ -73,7 +82,8 @@ class TalkerMTPCudaGraphWrapper:
         self.inputs_embeds_out_buf.copy_(result)
 
     def capture(self):
-        for _ in range(3):
+        """Warm up and capture _mtp_forward as a CUDA graph, pre-allocate CUDA memory."""
+        for _ in range(self.num_warmup_steps):
             self._mtp_forward()
         torch.cuda.synchronize(self.device)
 
@@ -95,6 +105,7 @@ class TalkerMTPCudaGraphWrapper:
         self.captured = True
 
     def warmup(self, device: torch.device):
+        """Capture the CUDA graph on the given device."""
         if not self.enabled:
             logger.info("TalkerMTPCudaGraphWrapper: disabled, skipping capture")
             return
@@ -112,8 +123,30 @@ class TalkerMTPCudaGraphWrapper:
 
     @torch.inference_mode()
     def _talker_mtp(self, input_ids, last_id_hidden, past_hidden, text_step):
+        """Run one MTP step via graph replay.
+
+        Copies the four input tensors into the static GPU buffers, replays the
+        captured graph, and returns clones of the output buffers so callers
+        receive independent tensors.
+        Currently supports bs=1 only.
+
+        Args:
+            input_ids: Layer-0 token id, shape broadcastable to [1, 1].
+            last_id_hidden: Layer-0 hidden state, shape broadcastable to [1, 1, H].
+            past_hidden: Previous talker hidden state, shape broadcastable to [1, 1, H].
+            text_step: Current text decoder hidden state, shape broadcastable to [1, 1, H].
+
+        Returns:
+            (inputs_embeds, audio_codes): shapes [1, H] and [1, num_code_groups].
+
+        Raises:
+            RuntimeError: If warmup() has not been called yet.
+        """
         if not self.captured or self.graph is None:
             raise RuntimeError("TalkerMTPCudaGraphWrapper: graph not captured — call warmup() first")
+
+        if input_ids.shape[0] != 1:
+            raise ValueError(f"TalkerMTPCudaGraphWrapper only supports bs=1, got input_ids.shape={input_ids.shape}")
 
         self.input_ids_buf.copy_(input_ids.reshape(1, 1))
         self.last_id_hidden_buf.copy_(last_id_hidden.reshape(1, 1, -1))
