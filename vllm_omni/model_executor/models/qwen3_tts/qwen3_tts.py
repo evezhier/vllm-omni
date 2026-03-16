@@ -112,8 +112,7 @@ class Qwen3TTSModelForGeneration(nn.Module):
                 decoder.enable_cudagraph()
                 logger.info("CUDA Graph enabled for speech tokenizer decoder")
         except Exception:
-                logger.warning("Failed to enable CUDA Graph for decoder", exc_info=True)
-
+            logger.warning("Failed to enable CUDA Graph for decoder", exc_info=True)
 
     @staticmethod
     def extract_val(d, key, default):

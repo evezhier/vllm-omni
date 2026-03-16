@@ -25,7 +25,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.models.qwen3 import Qwen3Model
 from vllm.model_executor.models.utils import AutoWeightsLoader, PPMissingLayer, WeightsMapper, maybe_prefix
 from vllm.sequence import IntermediateTensors
-
 from vllm.v1.utils import record_function_or_nullcontext
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
@@ -661,7 +660,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # Stays on GPU - gpu_resident_buffer_keys avoids the CPU round-trip.
         if hidden_states.numel() == 0:
             return {}
-        last = hidden_states[-1, :]#.detach().to("cpu").contiguous()
+        last = hidden_states[-1, :]
         return {"last_talker_hidden": last}
 
     # -------------------- prompt construction helpers --------------------
@@ -1580,7 +1579,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         return loaded
 
     def enable_cudagraph(self, device: torch.device | None = None):
-        from .cuda_graph_decoder_wrapper import TalkerMTPCudaGraphWrapper
+        from .cuda_graph_talker_wrapper import TalkerMTPCudaGraphWrapper
 
         if device is None:
             device = next(self.model.parameters()).device
@@ -1605,15 +1604,12 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         input_embeds: torch.Tensor,
         last_talker_hidden: torch.Tensor,
         text_step: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         with record_function_or_nullcontext("talker_mtp"):
-
             if self._cudagraph_enabled:
-                return self._cudagraph_wrapper._talker_mtp(
-                    input_ids, input_embeds, last_talker_hidden, text_step)
-            return self._talker_mtp(
-                input_ids, input_embeds, last_talker_hidden, text_step)
-    
+                return self._cudagraph_wrapper._talker_mtp(input_ids, input_embeds, last_talker_hidden, text_step)
+            return self._talker_mtp(input_ids, input_embeds, last_talker_hidden, text_step)
+
     @torch.inference_mode()
     def _talker_mtp(
         self,
