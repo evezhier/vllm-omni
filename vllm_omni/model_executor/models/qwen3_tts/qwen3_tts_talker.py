@@ -1605,6 +1605,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         last_talker_hidden: torch.Tensor,
         text_step: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run talker graph if available, else fall back to eager"""
         with record_function_or_nullcontext("talker_mtp"):
             if self._cudagraph_enabled:
                 return self._cudagraph_wrapper._talker_mtp(input_ids, input_embeds, last_talker_hidden, text_step)
