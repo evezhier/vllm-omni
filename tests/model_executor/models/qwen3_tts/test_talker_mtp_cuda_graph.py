@@ -109,7 +109,6 @@ class SyntheticCodePredictor(nn.Module):
         temperature: float = 0.9,
         top_k: int = 50,
         top_p: float = 1.0,
-        gumbel_noise: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
         bsz = int(layer0_code.shape[0])
         device = layer0_code.device
@@ -117,9 +116,8 @@ class SyntheticCodePredictor(nn.Module):
         all_codes = torch.zeros(bsz, self._num_groups, dtype=torch.long, device=device)
         all_codes[:, 0] = layer0_code.reshape(bsz)
 
-        use_gumbel = gumbel_noise is not None
         use_sampling = do_sample and temperature > 0
-        inv_temperature = 1.0 / max(temperature, 1e-6) if (use_sampling or use_gumbel) else 0.0
+        inv_temperature = 1.0 / max(temperature, 1e-6) if use_sampling else 0.0
 
         # Use last_talker_hidden as the shared hidden state for all steps
         hidden = last_talker_hidden.reshape(bsz, -1).to(self.lm_heads[0].weight.dtype)
@@ -127,13 +125,7 @@ class SyntheticCodePredictor(nn.Module):
         for step in range(1, self._num_groups):
             logits = self.lm_heads[step - 1](hidden)  # [bsz, vocab_size]
 
-            if use_gumbel:
-                scaled = logits * inv_temperature
-                if top_k > 0:
-                    topk_vals, _ = scaled.topk(top_k, dim=-1)
-                    scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
-                next_ids = (scaled + gumbel_noise[step - 1]).argmax(dim=-1, keepdim=True)
-            elif use_sampling:
+            if use_sampling:
                 scaled = logits * inv_temperature
                 if top_k > 0:
                     topk_vals, _ = scaled.topk(top_k, dim=-1)
@@ -237,9 +229,6 @@ def test_output_shapes(wrapper):
 
 class _ArgmaxWrapper(TalkerMTPCudaGraphWrapper):
     """TalkerMTPCudaGraphWrapper variant that captures argmax (do_sample=False)."""
-
-    def _refresh_gumbel_noise(self) -> None:  # noqa: D102
-        pass
 
     @torch.inference_mode
     def _mtp_forward(self):

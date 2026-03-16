@@ -10,7 +10,7 @@ class TalkerMTPCudaGraphWrapper:
     CUDA Graph wrapper for talker_mtp (multi-token prediction).
 
     Captures the entire MTP pipeline:
-    - Code predictor forward (residual codebooks, Gumbel-max sampling)
+    - Code predictor forward
     - Embedding summation
     - Text step addition
     """
@@ -46,22 +46,9 @@ class TalkerMTPCudaGraphWrapper:
         self.audio_codes_buf = torch.zeros(1, self.num_code_groups, dtype=torch.long, device=device)
         self.inputs_embeds_out_buf = torch.zeros(1, self.hidden_size, dtype=torch.bfloat16, device=device)
 
-        # Gumbel noise required to enable stochastic sampling
-        self.gumbel_noise_bufs = [
-            torch.zeros(1, self.vocab_size, dtype=torch.bfloat16, device=device)
-            for _ in range(self.num_code_groups - 1)
-        ]
-
         self.warmed_up = False
         self.graph = None
         self.captured = False
-
-    def _refresh_gumbel_noise(self) -> None:
-        """Regenerate Gumbel(0,1) noise in-place for each residual codebook step."""
-        for buf in self.gumbel_noise_bufs:
-            u = torch.rand(buf.shape, device=buf.device, dtype=torch.float32)
-            u.clamp_(1e-10, 1.0 - 1e-10)
-            buf.copy_(-torch.log(-torch.log(u)))
 
     @torch.inference_mode
     def _mtp_forward(self):
@@ -72,7 +59,6 @@ class TalkerMTPCudaGraphWrapper:
             do_sample=True,
             temperature=self.temperature,
             top_k=self.top_k,
-            gumbel_noise=self.gumbel_noise_bufs,
         )
         self.audio_codes_buf.copy_(audio_codes)
 
@@ -88,7 +74,6 @@ class TalkerMTPCudaGraphWrapper:
 
     def capture(self):
         for _ in range(3):
-            self._refresh_gumbel_noise()
             self._mtp_forward()
         torch.cuda.synchronize(self.device)
 
@@ -134,7 +119,6 @@ class TalkerMTPCudaGraphWrapper:
         self.last_id_hidden_buf.copy_(last_id_hidden.reshape(1, 1, -1))
         self.past_hidden_buf.copy_(past_hidden.reshape(1, 1, -1))
         self.text_step_buf.copy_(text_step.reshape(1, 1, -1))
-        self._refresh_gumbel_noise()
 
         self.graph.replay()
 
