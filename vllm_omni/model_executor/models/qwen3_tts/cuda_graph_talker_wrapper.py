@@ -71,7 +71,11 @@ class TalkerMTPCudaGraphWrapper:
         )
         self.audio_codes_buf.copy_(audio_codes)
 
-        residual_ids = audio_codes[:, 1:]
+        layer0 = self.audio_codes_buf[:, :1]
+        invalid0 = (layer0 < 0) | (layer0 >= int(self.vocab_size))
+        self.audio_codes_buf.masked_fill_(invalid0.expand_as(self.audio_codes_buf), 0)
+        residual_ids = self.audio_codes_buf[:, 1:]
+
         embeds = [self.last_id_hidden_buf]
         for i in range(self.num_code_groups - 1):
             emb = self.code_predictor.get_input_embeddings()[i](residual_ids[:, i : i + 1])
