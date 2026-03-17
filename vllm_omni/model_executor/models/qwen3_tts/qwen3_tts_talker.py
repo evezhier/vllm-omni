@@ -1592,9 +1592,13 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             talker_config=self.talker_config,
             enabled=True,
         )
-        self._cudagraph_wrapper.warmup(device)
-        self._cudagraph_enabled = True
-        logger.info("CUDA Graph enabled for TTS talker MTP")
+        try:
+            self._cudagraph_wrapper.warmup(device)
+            self._cudagraph_enabled = True
+            logger.info("CUDA Graph enabled for TTS talker MTP")
+        except Exception:
+            self._cudagraph_wrapper = None
+            logger.warning("CUDA Graph capture failed; falling back to eager execution", exc_info=True)
 
     # -------------------- GPU-side MTP fast-path --------------------
 
@@ -1608,7 +1612,12 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         """Run talker graph if available, else fall back to eager"""
         with record_function_or_nullcontext("talker_mtp"):
             if self._cudagraph_enabled:
-                return self._cudagraph_wrapper._talker_mtp(input_ids, input_embeds, last_talker_hidden, text_step)
+                if input_ids.shape[0] != 1:
+                    logger.warning(
+                        "Talker graph is enabled but does not support batching, falling back to eager execution."
+                    )
+                else:
+                    return self._cudagraph_wrapper._talker_mtp(input_ids, input_embeds, last_talker_hidden, text_step)
             return self._talker_mtp(input_ids, input_embeds, last_talker_hidden, text_step)
 
     @torch.inference_mode()
