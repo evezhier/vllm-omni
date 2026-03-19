@@ -582,7 +582,9 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             else:
                 # Subsequent prefill chunk: slice from stored embeddings at running offset.
                 if tts_pad_embed is None:
-                    raise RuntimeError("Missing `tts_pad_embed` in model_intermediate_buffer; prefill must initialize it.")
+                    raise RuntimeError(
+                        "Missing `tts_pad_embed` in model_intermediate_buffer; prefill must initialize it."
+                    )
                 offset = int(info_dict.get("talker_prefill_offset", 0) or 0)
                 if offset < 0:
                     offset = 0
