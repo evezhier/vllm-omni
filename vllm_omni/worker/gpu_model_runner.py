@@ -105,7 +105,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 getattr(self.model, "mtp_hidden_size", 0) or getattr(self.model_config.hf_text_config, "hidden_size")
             )
             # Defaults to max_num_seqs if max_cudagraph_capture_size is not set
-            max_batch_size = 4  # max(self.max_num_reqs, self.compilation_config.max_cudagraph_capture_size)
+            max_batch_size = max(self.max_num_reqs, self.compilation_config.max_cudagraph_capture_size)
             if cudagraph_mode.has_full_cudagraphs():
                 if has_separate_talker:
                     self.talker_mtp = CUDAGraphWrapper(talker_mtp, self.vllm_config, runtime_mode=CUDAGraphMode.FULL)
