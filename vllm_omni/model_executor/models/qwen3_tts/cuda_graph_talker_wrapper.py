@@ -9,10 +9,14 @@ class TalkerMTPCudaGraphWrapper:
     """
     CUDA Graph wrapper for talker_mtp (multi-token prediction).
 
-    Captures the entire MTP pipeline:
+    Captures the entire MTP pipeline for each batch-size bucket:
     - Code predictor forward
     - Embedding summation
     - Text step addition
+
+    At inference time the wrapper selects the smallest captured bucket that fits
+    the actual batch size, zero-pads the inputs, replays the corresponding graph,
+    and returns only the non-padded output rows.
     """
 
     def __init__(
@@ -24,6 +28,7 @@ class TalkerMTPCudaGraphWrapper:
         temperature=0.9,
         top_k=50,
         num_warmup_steps=3,
+        max_batch_size: int = 1,
     ):
         self.device = device
         self.device_index = torch.device(device).index or 0
@@ -37,20 +42,71 @@ class TalkerMTPCudaGraphWrapper:
         self.temperature = temperature
         self.top_k = top_k
 
-        # Static input buffers (fixed on GPU)
-        self.input_ids_buf = torch.zeros(1, 1, dtype=torch.long, device=device)
-        self.last_id_hidden_buf = torch.zeros(1, 1, self.hidden_size, dtype=torch.bfloat16, device=device)
-        self.past_hidden_buf = torch.zeros(1, 1, self.hidden_size, dtype=torch.bfloat16, device=device)
-        self.text_step_buf = torch.zeros(1, 1, self.hidden_size, dtype=torch.bfloat16, device=device)
+        self.batch_sizes = self._compute_bucket_sizes(max_batch_size)
 
-        # Static output buffers
-        self.audio_codes_buf = torch.zeros(1, self.num_code_groups, dtype=torch.long, device=device)
-        self.inputs_embeds_out_buf = torch.zeros(1, self.hidden_size, dtype=torch.bfloat16, device=device)
+        # Per-bucket static GPU buffers, keyed by batch size.
+        self._buffers: dict[int, dict[str, torch.Tensor]] = {}
+        for bs in self.batch_sizes:
+            self._buffers[bs] = {
+                "input_ids": torch.zeros(bs, 1, dtype=torch.long, device=device),
+                "last_id_hidden": torch.zeros(bs, 1, self.hidden_size, dtype=torch.bfloat16, device=device),
+                "past_hidden": torch.zeros(bs, 1, self.hidden_size, dtype=torch.bfloat16, device=device),
+                "text_step": torch.zeros(bs, 1, self.hidden_size, dtype=torch.bfloat16, device=device),
+                "audio_codes": torch.zeros(bs, self.num_code_groups, dtype=torch.long, device=device),
+                "inputs_embeds": torch.zeros(bs, self.hidden_size, dtype=torch.bfloat16, device=device),
+            }
+
+        # Current bucket's buffer dict; always set before _mtp_forward() is called.
+        self._active_bufs: dict[str, torch.Tensor] = self._buffers[self.batch_sizes[0]]
+
+        self.graphs: dict[int, CUDAGraph] = {}
 
         self.num_warmup_steps = num_warmup_steps
         self.warmed_up = False
-        self.graph = None
         self.captured = False
+
+    def _compute_bucket_sizes(self, max_batch_size: int) -> list[int]:
+        """Return sorted list of CUDA-graph bucket sizes covering 1..max_batch_size.
+
+        Uses powers of 2 up to max_batch_size, then appends max_batch_size itself
+        if it is not already a power of 2. Always includes 1.
+        """
+        sizes: list[int] = []
+        b = 1
+        while b <= max_batch_size:
+            sizes.append(b)
+            b *= 2
+        if sizes[-1] < max_batch_size:
+            sizes.append(max_batch_size)
+        return sizes
+
+    @property
+    def input_ids_buf(self) -> torch.Tensor:
+        return self._active_bufs["input_ids"]
+
+    @property
+    def last_id_hidden_buf(self) -> torch.Tensor:
+        return self._active_bufs["last_id_hidden"]
+
+    @property
+    def past_hidden_buf(self) -> torch.Tensor:
+        return self._active_bufs["past_hidden"]
+
+    @property
+    def text_step_buf(self) -> torch.Tensor:
+        return self._active_bufs["text_step"]
+
+    @property
+    def audio_codes_buf(self) -> torch.Tensor:
+        return self._active_bufs["audio_codes"]
+
+    @property
+    def inputs_embeds_out_buf(self) -> torch.Tensor:
+        return self._active_bufs["inputs_embeds"]
+
+    @property
+    def graph(self) -> CUDAGraph | None:
+        return self.graphs.get(1)
 
     @torch.inference_mode
     def _mtp_forward(self):
@@ -59,7 +115,7 @@ class TalkerMTPCudaGraphWrapper:
         Calls the code predictor to generate residual codebook tokens, then
         accumulates their embeddings together with the layer-0 hidden state and
         the text step to produce the next-step input embedding.
-        Results are written into the static output buffers.
+        Results are written into the active output buffers (_active_bufs).
         """
         audio_codes = self.code_predictor.forward(
             layer0_code=self.input_ids_buf,
@@ -81,35 +137,46 @@ class TalkerMTPCudaGraphWrapper:
             emb = self.code_predictor.get_input_embeddings()[i](residual_ids[:, i : i + 1])
             embeds.append(emb)
 
+        bs = self.input_ids_buf.shape[0]
         summed = torch.cat(embeds, dim=1).sum(1, keepdim=True)
-        result = (summed + self.text_step_buf).reshape(1, -1)
+        result = (summed + self.text_step_buf).reshape(bs, -1)
         self.inputs_embeds_out_buf.copy_(result)
 
     def capture(self):
-        """Warm up and capture _mtp_forward as a CUDA graph, pre-allocate CUDA memory."""
-        for _ in range(self.num_warmup_steps):
-            self._mtp_forward()
+        """Warm up and capture _mtp_forward as CUDA graphs for every bucket size.
+        Running the largest batch size first ensures that the code predictor's
+        _proj_buf is sized for the max batch size and is not reallocated.
+        """
+        for bs in reversed(self.batch_sizes):
+            self._active_bufs = self._buffers[bs]
+            for _ in range(self.num_warmup_steps):
+                self._mtp_forward()
         torch.cuda.synchronize(self.device)
 
-        # Capture on a dedicated side stream so the default stream is not
-        # polluted by graph memory.
-        with torch.cuda.device(self.device_index):
-            self.graph = CUDAGraph()
-            s = torch.cuda.Stream()
-            s.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(s):
-                # One additional warmup on the capture stream.
-                self._mtp_forward()
-                s.synchronize()
-                with torch.cuda.graph(self.graph):
-                    self._mtp_forward()
+        for bs in self.batch_sizes:
+            self._active_bufs = self._buffers[bs]
 
-        torch.cuda.current_stream().wait_stream(s)
+            # Capture on a dedicated side stream so the default stream is not
+            # polluted by graph memory.
+            with torch.cuda.device(self.device_index):
+                graph = CUDAGraph()
+                s = torch.cuda.Stream()
+                s.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(s):
+                    # One additional warmup on the capture stream.
+                    self._mtp_forward()
+                    s.synchronize()
+                    with torch.cuda.graph(graph):
+                        self._mtp_forward()
+
+            torch.cuda.current_stream().wait_stream(s)
+            self.graphs[bs] = graph
+
         torch.cuda.synchronize()
         self.captured = True
 
     def warmup(self, device: torch.device):
-        """Capture the CUDA graph on the given device."""
+        """Capture CUDA graphs for all batch-size buckets on the given device."""
         if not self.enabled:
             logger.info("TalkerMTPCudaGraphWrapper: disabled, skipping capture")
             return
@@ -123,40 +190,56 @@ class TalkerMTPCudaGraphWrapper:
         self.device_index = device.index or 0
         self.capture()
         self.warmed_up = True
-        logger.info("TalkerMTPCudaGraphWrapper: CUDA graph captured")
+        logger.info(
+            "TalkerMTPCudaGraphWrapper: CUDA graphs captured for batch sizes %s",
+            self.batch_sizes,
+        )
 
     @torch.inference_mode()
     def _talker_mtp(self, input_ids, last_id_hidden, past_hidden, text_step):
         """Run one MTP step via graph replay.
-
-        Copies the four input tensors into the static GPU buffers, replays the
-        captured graph, and returns clones of the output buffers so callers
-        receive independent tensors.
-        Currently supports bs=1 only.
+        Zero-pads the inputs to the smallest fitting bucket, unpads after replay.
 
         Args:
-            input_ids: Layer-0 token id, shape broadcastable to [1, 1].
-            last_id_hidden: Layer-0 hidden state, shape broadcastable to [1, 1, H].
-            past_hidden: Previous talker hidden state, shape broadcastable to [1, 1, H].
-            text_step: Current text decoder hidden state, shape broadcastable to [1, 1, H].
+            input_ids:      Layer-0 token ids,            shape [B] or [B, 1].
+            last_id_hidden: Layer-0 hidden state,         shape [B, H] or [B, 1, H].
+            past_hidden:    Previous talker hidden state, shape [B, H] or [B, 1, H].
+            text_step:      Current text hidden state,    shape [B, H] or [B, 1, H].
 
         Returns:
-            (inputs_embeds, audio_codes): shapes [1, H] and [1, num_code_groups].
+            (inputs_embeds, audio_codes): shapes [B, H] and [B, num_code_groups].
 
         Raises:
             RuntimeError: If warmup() has not been called yet.
+            ValueError:   If B exceeds the maximum captured bucket size.
         """
-        if not self.captured or self.graph is None:
+        if not self.captured or not self.graphs:
             raise RuntimeError("TalkerMTPCudaGraphWrapper: graph not captured — call warmup() first")
 
-        if input_ids.shape[0] != 1:
-            raise ValueError(f"TalkerMTPCudaGraphWrapper only supports bs=1, got input_ids.shape={input_ids.shape}")
+        actual_bs = input_ids.shape[0]
+        target_bs = min((b for b in self.graphs if b >= actual_bs), default=None)
+        if target_bs is None:
+            logger.warning(
+                "TalkerMTPCudaGraphWrapper: batch size %d exceeds max captured bucket %d, "
+                "falling back to eager execution",
+                actual_bs,
+                max(self.graphs),
+            )
+            return self.talker._talker_mtp(input_ids, last_id_hidden, past_hidden, text_step)
 
-        self.input_ids_buf.copy_(input_ids.reshape(1, 1))
-        self.last_id_hidden_buf.copy_(last_id_hidden.reshape(1, 1, -1))
-        self.past_hidden_buf.copy_(past_hidden.reshape(1, 1, -1))
-        self.text_step_buf.copy_(text_step.reshape(1, 1, -1))
+        bufs = self._buffers[target_bs]
 
-        self.graph.replay()
+        bufs["input_ids"][:actual_bs].copy_(input_ids.reshape(actual_bs, 1))
+        bufs["last_id_hidden"][:actual_bs].copy_(last_id_hidden.reshape(actual_bs, 1, -1))
+        bufs["past_hidden"][:actual_bs].copy_(past_hidden.reshape(actual_bs, 1, -1))
+        bufs["text_step"][:actual_bs].copy_(text_step.reshape(actual_bs, 1, -1))
 
-        return self.inputs_embeds_out_buf.clone(), self.audio_codes_buf.clone()
+        if actual_bs < target_bs:
+            bufs["input_ids"][actual_bs:].zero_()
+            bufs["last_id_hidden"][actual_bs:].zero_()
+            bufs["past_hidden"][actual_bs:].zero_()
+            bufs["text_step"][actual_bs:].zero_()
+
+        self.graphs[target_bs].replay()
+
+        return bufs["inputs_embeds"][:actual_bs].clone(), bufs["audio_codes"][:actual_bs].clone()

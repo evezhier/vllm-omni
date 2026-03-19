@@ -1578,7 +1578,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         logger.info("Loaded %d weights for Qwen3TTSTalkerForConditionalGeneration", len(loaded))
         return loaded
 
-    def enable_cudagraph(self, device: torch.device | None = None):
+    def enable_cudagraph(self, device: torch.device | None = None, max_batch_size: int = 1):
         from .cuda_graph_talker_wrapper import TalkerMTPCudaGraphWrapper
 
         if device is None:
@@ -1591,11 +1591,12 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             talker_model=self,
             talker_config=self.talker_config,
             enabled=True,
+            max_batch_size=max_batch_size,
         )
         try:
             self._cudagraph_wrapper.warmup(device)
             self._cudagraph_enabled = True
-            logger.info("CUDA Graph enabled for TTS talker MTP")
+            logger.info("CUDA Graph enabled for TTS talker MTP (max_batch_size=%d)", max_batch_size)
         except Exception:
             self._cudagraph_wrapper = None
             logger.warning("CUDA Graph capture failed; falling back to eager execution", exc_info=True)
@@ -1612,12 +1613,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         """Run talker graph if available, else fall back to eager"""
         with record_function_or_nullcontext("talker_mtp"):
             if self._cudagraph_enabled:
-                if input_ids.shape[0] != 1:
-                    logger.warning(
-                        "Talker graph is enabled but does not support batching, falling back to eager execution."
-                    )
-                else:
-                    return self._cudagraph_wrapper._talker_mtp(input_ids, input_embeds, last_talker_hidden, text_step)
+                return self._cudagraph_wrapper._talker_mtp(input_ids, input_embeds, last_talker_hidden, text_step)
             return self._talker_mtp(input_ids, input_embeds, last_talker_hidden, text_step)
 
     @torch.inference_mode()

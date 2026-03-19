@@ -7,6 +7,7 @@ Verifies:
   - Warmup / graph capture mechanics.
   - Output shape and validity of audio codes.
   - Numerical equivalence with sampling disabled (no randomness).
+  - Batch size > 1 support via bucket-based graph capture.
 """
 
 from __future__ import annotations
@@ -175,18 +176,19 @@ def wrapper(talker_model, talker_config):
         enabled=True,
         temperature=0.9,
         top_k=VOCAB_SIZE,  # allow all tokens
+        max_batch_size=4,
     )
     w.warmup(DEVICE)
     return w
 
 
-def _random_inputs(hidden_size: int = HIDDEN_SIZE, seed: int | None = None):
+def _random_inputs(bs: int = 1, hidden_size: int = HIDDEN_SIZE, seed: int | None = None):
     if seed is not None:
         torch.manual_seed(seed)
-    input_ids = torch.randint(0, VOCAB_SIZE, (1,), dtype=torch.long, device=DEVICE)
-    last_id_hidden = torch.randn(1, hidden_size, dtype=torch.bfloat16, device=DEVICE)
-    past_hidden = torch.randn(1, hidden_size, dtype=torch.bfloat16, device=DEVICE)
-    text_step = torch.randn(1, hidden_size, dtype=torch.bfloat16, device=DEVICE)
+    input_ids = torch.randint(0, VOCAB_SIZE, (bs,), dtype=torch.long, device=DEVICE)
+    last_id_hidden = torch.randn(bs, hidden_size, dtype=torch.bfloat16, device=DEVICE)
+    past_hidden = torch.randn(bs, hidden_size, dtype=torch.bfloat16, device=DEVICE)
+    text_step = torch.randn(bs, hidden_size, dtype=torch.bfloat16, device=DEVICE)
     return input_ids, last_id_hidden, past_hidden, text_step
 
 
@@ -210,15 +212,30 @@ def test_warmup_sets_captured_flag(talker_model, talker_config):
     assert w.graph is not None
 
 
-def test_output_shapes(wrapper):
-    inputs = _random_inputs(seed=42)
+def test_captures_all_buckets(talker_model, talker_config):
+    """Wrapper should capture one graph per bucket size."""
+    w = TalkerMTPCudaGraphWrapper(
+        talker_model=talker_model,
+        talker_config=talker_config,
+        device=DEVICE,
+        enabled=True,
+        top_k=VOCAB_SIZE,
+        max_batch_size=4,
+    )
+    w.warmup(DEVICE)
+    assert set(w.graphs.keys()) == {1, 2, 4}
+
+
+@pytest.mark.parametrize("bs", [1, 2, 3, 4])
+def test_output_shapes(wrapper, bs):
+    inputs = _random_inputs(bs=bs, seed=42)
     inputs_embeds, audio_codes = wrapper._talker_mtp(*inputs)
 
-    assert inputs_embeds.shape == (1, HIDDEN_SIZE), (
-        f"Expected inputs_embeds shape (1, {HIDDEN_SIZE}), got {inputs_embeds.shape}"
+    assert inputs_embeds.shape == (bs, HIDDEN_SIZE), (
+        f"Expected inputs_embeds shape ({bs}, {HIDDEN_SIZE}), got {inputs_embeds.shape}"
     )
-    assert audio_codes.shape == (1, NUM_CODE_GROUPS), (
-        f"Expected audio_codes shape (1, {NUM_CODE_GROUPS}), got {audio_codes.shape}"
+    assert audio_codes.shape == (bs, NUM_CODE_GROUPS), (
+        f"Expected audio_codes shape ({bs}, {NUM_CODE_GROUPS}), got {audio_codes.shape}"
     )
 
 
@@ -240,42 +257,39 @@ class _ArgmaxWrapper(TalkerMTPCudaGraphWrapper):
         )
         self.audio_codes_buf.copy_(audio_codes)
 
+        bs = audio_codes.shape[0]
         residual_ids = audio_codes[:, 1:]
-        embeds = [self.last_id_hidden_buf]
+        self.inputs_embeds_out_buf.copy_(self.last_id_hidden_buf.reshape(bs, -1))
+        codec_embeds = self.code_predictor.get_input_embeddings()
         for i in range(self.num_code_groups - 1):
-            emb = self.code_predictor.get_input_embeddings()[i](residual_ids[:, i : i + 1])
-            embeds.append(emb)
-
-        summed = torch.cat(embeds, dim=1).sum(1, keepdim=True)
-        result = (summed + self.text_step_buf).reshape(1, -1)
-        self.inputs_embeds_out_buf.copy_(result)
+            self.inputs_embeds_out_buf.add_(codec_embeds[i](residual_ids[:, i : i + 1]).reshape(bs, -1))
+        self.inputs_embeds_out_buf.add_(self.text_step_buf.reshape(bs, -1))
 
 
 def _eager_mtp_argmax(predictor, input_ids, last_id_hidden, past_hidden, text_step):
+    bsz = input_ids.shape[0]
     num_groups = predictor.config.num_code_groups
     with torch.inference_mode():
         audio_codes = predictor.forward(
-            layer0_code=input_ids.reshape(1, 1),
-            layer0_embed=last_id_hidden.reshape(1, 1, -1),
-            last_talker_hidden=past_hidden.reshape(1, 1, -1),
+            layer0_code=input_ids.reshape(bsz, 1),
+            layer0_embed=last_id_hidden.reshape(bsz, 1, -1),
+            last_talker_hidden=past_hidden.reshape(bsz, 1, -1),
             do_sample=False,
         )
 
         residual_ids = audio_codes[:, 1:]
-        embeds = [last_id_hidden.reshape(1, 1, -1)]
+        inputs_embeds = last_id_hidden.reshape(bsz, -1).clone()
+        codec_embeds = predictor.get_input_embeddings()
         for i in range(num_groups - 1):
-            emb = predictor.get_input_embeddings()[i](residual_ids[:, i : i + 1])
-            embeds.append(emb)
-
-        summed = torch.cat(embeds, dim=1).sum(1, keepdim=True)
-        inputs_embeds = (summed + text_step.reshape(1, 1, -1)).reshape(1, -1)
+            inputs_embeds.add_(codec_embeds[i](residual_ids[:, i : i + 1]).reshape(bsz, -1))
+        inputs_embeds.add_(text_step.reshape(bsz, -1))
 
     return inputs_embeds, audio_codes
 
 
 @pytest.mark.parametrize("seed", [42, 99, 1])
 def test_graph_matches_eager_argmax(talker_model, talker_config, seed):
-    """Argmax CUDA graph must be bit-identical to eager argmax."""
+    """Argmax CUDA graph must be bit-identical to eager argmax (bs=1)."""
     w = _ArgmaxWrapper(
         talker_model=talker_model,
         talker_config=talker_config,
@@ -285,7 +299,7 @@ def test_graph_matches_eager_argmax(talker_model, talker_config, seed):
     )
     w.warmup(DEVICE)
 
-    input_ids, last_id_hidden, past_hidden, text_step = _random_inputs(seed=seed)
+    input_ids, last_id_hidden, past_hidden, text_step = _random_inputs(bs=1, seed=seed)
     graph_embeds, graph_codes = w._talker_mtp(input_ids, last_id_hidden, past_hidden, text_step)
     eager_embeds, eager_codes = _eager_mtp_argmax(
         talker_model.code_predictor, input_ids, last_id_hidden, past_hidden, text_step
@@ -296,4 +310,30 @@ def test_graph_matches_eager_argmax(talker_model, talker_config, seed):
     )
     torch.testing.assert_close(
         graph_embeds, eager_embeds, atol=0, rtol=0, msg="inputs_embeds mismatch (argmax, no sampling)"
+    )
+
+
+@pytest.mark.parametrize("bs", [2, 3, 4])
+@pytest.mark.parametrize("seed", [42, 7])
+def test_graph_matches_eager_argmax_batched(talker_model, talker_config, bs, seed):
+    """Argmax CUDA graph must be bit-identical to eager argmax for bs > 1."""
+    w = _ArgmaxWrapper(
+        talker_model=talker_model,
+        talker_config=talker_config,
+        device=DEVICE,
+        enabled=True,
+        top_k=VOCAB_SIZE,
+        max_batch_size=4,
+    )
+    w.warmup(DEVICE)
+
+    input_ids, last_id_hidden, past_hidden, text_step = _random_inputs(bs=bs, seed=seed)
+    graph_embeds, graph_codes = w._talker_mtp(input_ids, last_id_hidden, past_hidden, text_step)
+    eager_embeds, eager_codes = _eager_mtp_argmax(
+        talker_model.code_predictor, input_ids, last_id_hidden, past_hidden, text_step
+    )
+
+    torch.testing.assert_close(graph_codes, eager_codes, atol=0, rtol=0, msg=f"audio_codes mismatch (argmax, bs={bs})")
+    torch.testing.assert_close(
+        graph_embeds, eager_embeds, atol=0, rtol=0, msg=f"inputs_embeds mismatch (argmax, bs={bs})"
     )

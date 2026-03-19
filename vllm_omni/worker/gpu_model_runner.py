@@ -100,20 +100,21 @@ class OmniGPUModelRunner(GPUModelRunner):
             # Only wrap talker_mtp in CUDAGraphWrapper for Omni models that
             # have a separate .talker sub-module.  TTS models use model-specific graph implementation.
             has_separate_talker = getattr(self.model, "talker", None) is not None
+            # TTS exposes mtp_hidden_size; Omni uses hf_text_config.hidden_size.
+            hidden_size = int(
+                getattr(self.model, "mtp_hidden_size", 0) or getattr(self.model_config.hf_text_config, "hidden_size")
+            )
+            # Defaults to max_num_seqs if max_cudagraph_capture_size is not set
+            max_batch_size = 4  # max(self.max_num_reqs, self.compilation_config.max_cudagraph_capture_size)
             if cudagraph_mode.has_full_cudagraphs():
                 if has_separate_talker:
                     self.talker_mtp = CUDAGraphWrapper(talker_mtp, self.vllm_config, runtime_mode=CUDAGraphMode.FULL)
                 else:
                     if hasattr(self.model, "enable_cudagraph"):
                         try:
-                            self.model.enable_cudagraph()
+                            self.model.enable_cudagraph(max_batch_size=max_batch_size)
                         except Exception:
                             logger.warning("Failed to enable CUDA graph for TTS talker", exc_info=True)
-            # TTS exposes mtp_hidden_size; Omni uses hf_text_config.hidden_size.
-            hidden_size = int(
-                getattr(self.model, "mtp_hidden_size", 0) or getattr(self.model_config.hf_text_config, "hidden_size")
-            )
-            max_batch_size = max(self.max_num_reqs, self.compilation_config.max_cudagraph_capture_size)
             self.talker_mtp_input_ids = self._make_buffer(max_batch_size, dtype=torch.int32)
             self.talker_mtp_inputs_embeds = self._make_buffer(
                 max_batch_size, hidden_size, dtype=self.dtype, numpy=False
