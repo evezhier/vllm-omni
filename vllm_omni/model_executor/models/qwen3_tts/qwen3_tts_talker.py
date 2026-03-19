@@ -411,9 +411,6 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         self._cudagraph_enabled = False
         self._cudagraph_wrapper = None
 
-        # Keys that should stay on GPU in model_intermediate_buffer to avoid CPU↔GPU round-trips
-        self.gpu_resident_buffer_keys: set[str] = {"last_talker_hidden"}
-
     # -------------------- vLLM required hooks --------------------
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
@@ -522,21 +519,13 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         input_embeds: torch.Tensor | None,
         **info_dict: Any,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
-        # Metadata may be passed flattened or under `additional_information`; normalize to flattened keys.
-        additional_information = info_dict.get("additional_information")
-        if isinstance(additional_information, dict):
-            merged: dict[str, Any] = {k: v for k, v in info_dict.items() if k != "additional_information"}
-            for k, v in additional_information.items():
-                merged.setdefault(k, v)
-            info_dict = merged
-
         span_len = int(input_ids.shape[0])
         if span_len <= 0:
             return input_ids, input_embeds if input_embeds is not None else self.embed_input_ids(input_ids), {}
 
         text_list = info_dict.get("text")
         if not isinstance(text_list, list) or not text_list or not text_list[0]:
-            raise ValueError("Missing additional_information.text for Qwen3-TTS AR talker.")
+            raise ValueError("Missing model_intermediate_buffer['text'] for Qwen3-TTS AR talker.")
 
         task_type = (info_dict.get("task_type") or ["CustomVoice"])[0]
         codec_streaming_val = info_dict.get("codec_streaming")
@@ -593,7 +582,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             else:
                 # Subsequent prefill chunk: slice from stored embeddings at running offset.
                 if tts_pad_embed is None:
-                    raise RuntimeError("Missing `tts_pad_embed` in additional_information; prefill must initialize it.")
+                    raise RuntimeError("Missing `tts_pad_embed` in model_intermediate_buffer; prefill must initialize it.")
                 offset = int(info_dict.get("talker_prefill_offset", 0) or 0)
                 if offset < 0:
                     offset = 0
@@ -625,7 +614,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # These tensors stay on GPU via gpu_resident_buffer_keys - .to() is a no-op.
         tts_pad_embed_buf = info_dict.get("tts_pad_embed")
         if not isinstance(tts_pad_embed_buf, torch.Tensor):
-            raise RuntimeError("Missing `tts_pad_embed` in additional_information; prefill must run first.")
+            raise RuntimeError("Missing `tts_pad_embed` in model_intermediate_buffer; prefill must run first.")
         tts_pad_embed = tts_pad_embed_buf.to(device=input_ids.device, dtype=torch.bfloat16).reshape(1, -1)
 
         tail = info_dict.get("tailing_text_hidden")
@@ -638,7 +627,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
 
         last_hidden_gpu = info_dict.get("last_talker_hidden")
         if not isinstance(last_hidden_gpu, torch.Tensor):
-            raise RuntimeError("Missing `last_talker_hidden` in additional_information; postprocess must run.")
+            raise RuntimeError("Missing `last_talker_hidden` in model_intermediate_buffer; postprocess must run.")
         assert last_hidden_gpu.device == input_ids.device
         past_hidden = last_hidden_gpu
 
@@ -1449,7 +1438,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         elif task_type == "CustomVoice":
             speaker = (info_dict.get("speaker") or [""])[0]
             if not isinstance(speaker, str) or not speaker.strip():
-                raise ValueError("CustomVoice requires additional_information.speaker.")
+                raise ValueError("CustomVoice requires model_intermediate_buffer['speaker'].")
             spk_id_map = getattr(self.talker_config, "spk_id", None) or {}
             if speaker.lower() not in spk_id_map:
                 raise ValueError(f"Unsupported speaker: {speaker}")

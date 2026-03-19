@@ -1366,9 +1366,10 @@ class OmniGPUModelRunner(GPUModelRunner):
         if req_state is None:
             return
         existing = self.model_intermediate_buffer.setdefault(req_id, {})
+        gpu_keys: set[str] = getattr(self.model, "gpu_resident_buffer_keys", set())
         for k, v in upd.items():
             if isinstance(v, torch.Tensor):
-                existing[k] = v.detach().to("cpu").contiguous()
+                existing[k] = v.detach() if k in gpu_keys else v.detach().to("cpu").contiguous()
             elif isinstance(v, list):
                 existing[k] = [
                     (item.detach().to("cpu").contiguous() if isinstance(item, torch.Tensor) else item) for item in v
